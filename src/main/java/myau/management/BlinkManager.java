@@ -27,6 +27,11 @@ public class BlinkManager {
     public boolean blinking = false;
     public Deque<Packet<?>> blinkedPackets = new ConcurrentLinkedDeque<>();
 
+    /**
+     * 被缓存的 C03PacketPlayer（移动）包数量，替代每次调用时的 stream 统计。
+     */
+    private int cachedMovementPackets = 0;
+
     public boolean offerPacket(Packet<?> packet) {
         if (this.blinkModule == BlinkModules.NONE || packet instanceof C00PacketKeepAlive || packet instanceof C01PacketChatMessage) {
             return false;
@@ -34,6 +39,9 @@ public class BlinkManager {
             return false;
         } else {
             this.blinkedPackets.offer(packet);
+            if (packet instanceof C03PacketPlayer) {
+                this.cachedMovementPackets++;
+            }
             return true;
         }
     }
@@ -57,6 +65,7 @@ public class BlinkManager {
                 PacketUtil.sendPacketNoEvent(blinkedPacket);
             }
             this.blinkedPackets.clear();
+            this.cachedMovementPackets = 0;
             this.blinkModule = BlinkModules.NONE;
         }
         return true;
@@ -67,7 +76,7 @@ public class BlinkManager {
     }
 
     public long countMovement() {
-        return this.blinkedPackets.stream().filter(packet -> packet instanceof C03PacketPlayer).count();
+        return this.cachedMovementPackets;
     }
 
     public boolean isBlinking() {

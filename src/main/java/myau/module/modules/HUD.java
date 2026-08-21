@@ -9,7 +9,6 @@ import myau.events.Render2DEvent;
 import myau.events.TickEvent;
 import myau.mixin.IAccessorGuiChat;
 import myau.module.Module;
-import myau.util.ColorUtil;
 import myau.util.RenderUtil;
 import myau.property.properties.*;
 import net.minecraft.client.Minecraft;
@@ -23,11 +22,16 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.stream.Collectors;
 
 public class HUD extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
-    private List<Module> activeModules = new ArrayList<>();
+
+    /**
+     * 复用的 HSB 缓冲，避免每帧分配 float[3] 数组（渲染循环为单线程）。
+     */
+    private static final float[] HSB_BUFFER = new float[3];
+
+    private List<RenderEntry> renderEntries = new ArrayList<>();
     public final ModeProperty colorMode = new ModeProperty(
             "color", 3, new String[]{"RAINBOW", "CHROMA", "ASTOLFO", "CUSTOM1", "CUSTOM12", "CUSTOM123"}
     );
@@ -74,22 +78,6 @@ public class HUD extends Module {
         return moduleSuffix;
     }
 
-    private int getModuleWidth(Module module) {
-        return this.calculateStringWidth(
-                this.getModuleName(module), this.getModuleSuffix(module)
-        );
-    }
-
-    private int calculateStringWidth(String string, String[] arr) {
-        int width = mc.fontRendererObj.getStringWidth(string);
-        if (this.suffixes.getValue()) {
-            for (String str : arr) {
-                width += 3 + mc.fontRendererObj.getStringWidth(str);
-            }
-        }
-        return width;
-    }
-
     private float getColorCycle(long long3, long long4) {
         long speed = (long) (3000.0 / Math.pow(Math.min(Math.max(0.5F, this.colorSpeed.getValue()), 1.5F), 3.0));
         return 1.0F - (float) (Math.abs(long3 - long4 * 300L) % speed) / (float) speed;
@@ -104,53 +92,98 @@ public class HUD extends Module {
     }
 
     public Color getColor(long time, long offset) {
-        Color color = Color.white;
+        return new Color(this.getColorRGB(time, offset));
+    }
+
+    /**
+     * 直接返回 ARGB 整数，避免每帧创建 Color 对象与 HSB 数组分配。
+     * 语义与 getColor 完全一致，仅用于高频渲染路径。
+     */
+    public int getColorRGB(long time, long offset) {
+        int rgb;
         switch (this.colorMode.getValue()) {
             case 0:
-                color = ColorUtil.fromHSB(this.getColorCycle(time, offset), 1.0F, 1.0F);
+                rgb = Color.HSBtoRGB(this.getColorCycle(time, offset), 1.0F, 1.0F);
                 break;
             case 1:
-                color = ColorUtil.fromHSB(this.getColorCycle(time / 3L, 0L), 1.0F, 1.0F);
+                rgb = Color.HSBtoRGB(this.getColorCycle(time / 3L, 0L), 1.0F, 1.0F);
                 break;
             case 2:
                 float cycle = this.getColorCycle(time, offset);
                 if (cycle % 1.0F < 0.5F) {
                     cycle = 1.0F - cycle % 1.0F;
                 }
-                color = ColorUtil.fromHSB(cycle, 1.0F, 1.0F);
+                rgb = Color.HSBtoRGB(cycle, 1.0F, 1.0F);
                 break;
             case 3:
-                color = new Color(this.custom1.getValue());
+                rgb = this.custom1.getValue();
                 break;
             case 4:
-                double cycle1 = this.getColorCycle(time, offset);
-                color = ColorUtil.interpolate(
-                        (float) (2.0 * Math.abs(cycle1 - Math.floor(cycle1 + 0.5))),
-                        new Color(this.custom1.getValue()),
-                        new Color(this.custom2.getValue())
+                float cycle4 = this.getColorCycle(time, offset);
+                rgb = interpolateRGB(
+                        (float) (2.0 * Math.abs(cycle4 - Math.floor(cycle4 + 0.5))),
+                        this.custom1.getValue(),
+                        this.custom2.getValue()
                 );
                 break;
             case 5:
-                double cycle2 = this.getColorCycle(time, offset);
-                float floor = (float) (2.0 * Math.abs(cycle2 - Math.floor(cycle2 + 0.5)));
+                float cycle5 = this.getColorCycle(time, offset);
+                float floor = (float) (2.0 * Math.abs(cycle5 - Math.floor(cycle5 + 0.5)));
                 if (floor <= 0.5F) {
-                    color = ColorUtil.interpolate(floor * 2.0F, new Color(this.custom1.getValue()), new Color(this.custom2.getValue()));
+                    rgb = interpolateRGB(floor * 2.0F, this.custom1.getValue(), this.custom2.getValue());
                 } else {
-                    color = ColorUtil.interpolate((floor - 0.5F) * 2.0F, new Color(this.custom2.getValue()), new Color(this.custom3.getValue()));
+                    rgb = interpolateRGB((floor - 0.5F) * 2.0F, this.custom2.getValue(), this.custom3.getValue());
                 }
+                break;
+            default:
+                rgb = 0xFFFFFF;
         }
-        float[] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
-        return Color.getHSBColor(
-                hsb[0],
-                hsb[1] * (this.colorSaturation.getValue().floatValue() / 100.0F),
-                hsb[2] * (this.colorBrightness.getValue().floatValue() / 100.0F)
-        );
+        float saturation = this.colorSaturation.getValue().floatValue() / 100.0F;
+        float brightness = this.colorBrightness.getValue().floatValue() / 100.0F;
+        if (saturation != 1.0F || brightness != 1.0F) {
+            Color.RGBtoHSB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, HSB_BUFFER);
+            rgb = Color.HSBtoRGB(HSB_BUFFER[0], HSB_BUFFER[1] * saturation, HSB_BUFFER[2] * brightness);
+        }
+        return rgb;
+    }
+
+    private static int interpolateRGB(float progress, int start, int end) {
+        progress = Math.min(Math.max(progress, 0.0F), 1.0F);
+        int sr = (start >> 16) & 0xFF;
+        int sg = (start >> 8) & 0xFF;
+        int sb = start & 0xFF;
+        int er = (end >> 16) & 0xFF;
+        int eg = (end >> 8) & 0xFF;
+        int eb = end & 0xFF;
+        return (0xFF << 24)
+                | (sr + (int) (progress * (er - sr))) << 16
+                | (sg + (int) (progress * (eg - sg))) << 8
+                | (sb + (int) (progress * (eb - sb)));
     }
 
     @EventTarget
     public void onTick(TickEvent event) {
         if (this.isEnabled() && event.getType() == EventType.POST) {
-            this.activeModules = Myau.moduleManager.modules.values().stream().filter(module -> module.isEnabled() && !module.isHidden()).sorted(Comparator.comparingInt(this::getModuleWidth).reversed()).collect(Collectors.<Module>toList());
+            ArrayList<RenderEntry> entries = new ArrayList<>();
+            for (Module module : Myau.moduleManager.modules.values()) {
+                if (!module.isEnabled() || module.isHidden()) {
+                    continue;
+                }
+                String moduleName = this.getModuleName(module);
+                String[] moduleSuffix = this.getModuleSuffix(module);
+                int nameWidth = mc.fontRendererObj.getStringWidth(moduleName);
+                int totalWidth = nameWidth;
+                int[] suffixWidths = new int[moduleSuffix.length];
+                if (this.suffixes.getValue()) {
+                    for (int i = 0; i < moduleSuffix.length; i++) {
+                        suffixWidths[i] = mc.fontRendererObj.getStringWidth(moduleSuffix[i]);
+                        totalWidth += 3 + suffixWidths[i];
+                    }
+                }
+                entries.add(new RenderEntry(moduleName, moduleSuffix, nameWidth, suffixWidths, totalWidth));
+            }
+            entries.sort(Comparator.comparingInt(RenderEntry::totalWidth).reversed());
+            this.renderEntries = entries;
         }
     }
 
@@ -167,31 +200,37 @@ public class HUD extends Module {
                         (float) (mc.currentScreen.height - 2),
                         1.5F,
                         0,
-                        this.getColor(System.currentTimeMillis()).getRGB()
+                        this.getColorRGB(System.currentTimeMillis(), 0L)
                 );
                 RenderUtil.disableRenderState();
             }
         }
         if (this.isEnabled() && !mc.gameSettings.showDebugInfo) {
+            ScaledResolution sr = new ScaledResolution(mc);
             float height = (float) mc.fontRendererObj.FONT_HEIGHT - 1.0F;
             float x = (float) this.offsetX.getValue()
                     + (1.0F + (this.showBar.getValue() ? (this.shadow.getValue() ? 2.0F : 1.0F) : 0.0F)) * this.scale.getValue();
             float y = (float) this.offsetY.getValue() + 1.0F * this.scale.getValue();
             if (this.posX.getValue() == 1) {
-                x = (float) new ScaledResolution(mc).getScaledWidth() - x;
+                x = (float) sr.getScaledWidth() - x;
             }
             if (this.posY.getValue() == 1) {
-                y = (float) new ScaledResolution(mc).getScaledHeight() - y - height * this.scale.getValue();
+                y = (float) sr.getScaledHeight() - y - height * this.scale.getValue();
             }
             GlStateManager.pushMatrix();
             GlStateManager.scale(this.scale.getValue(), this.scale.getValue(), 0.0F);
             long l = System.currentTimeMillis();
             long offset = 0L;
-            for (Module module : this.activeModules) {
-                String moduleName = this.getModuleName(module);
-                String[] moduleSuffix = this.getModuleSuffix(module);
-                float totalWidth = (float) (this.calculateStringWidth(moduleName, moduleSuffix) - (this.shadow.getValue() ? 0 : 1));
-                int color = this.getColor(l, offset).getRGB();
+            int bgColor = 0;
+            if (this.background.getValue() > 0) {
+                int alpha = (int) (this.background.getValue().floatValue() / 100.0F * 255.0F);
+                bgColor = (alpha & 0xFF) << 24;
+            }
+            for (RenderEntry entry : this.renderEntries) {
+                String moduleName = entry.name;
+                String[] moduleSuffix = entry.suffix;
+                float totalWidth = (float) (entry.totalWidth - (this.shadow.getValue() ? 0 : 1));
+                int color = this.getColorRGB(l, offset);
                 float pad = this.padding.getValue();
                 float bgX1 = x / this.scale.getValue() - 1.0F - pad - (this.posX.getValue() == 0 ? 0.0F : totalWidth);
                 float bgY1 = y / this.scale.getValue() - pad - (this.posY.getValue() == 0 ? (offset == 0L ? 1.0F : 0.0F) : (this.shadow.getValue() ? 1.0F : 0.0F));
@@ -199,13 +238,12 @@ public class HUD extends Module {
                 float bgY2 = y / this.scale.getValue() + height + pad + (this.posY.getValue() == 0 ? (this.shadow.getValue() ? 1.0F : 0.0F) : (offset == 0L ? 1.0F : 0.0F));
                 RenderUtil.enableRenderState();
                 if (this.background.getValue() > 0) {
-                    int bgColor = new Color(0.0F, 0.0F, 0.0F, this.background.getValue().floatValue() / 100.0F).getRGB();
                     if (this.rounded.getValue()) {
                         float bgW = bgX2 - bgX1;
                         float bgH = bgY2 - bgY1;
                         float rad = this.cornerRadius.getValue();
                         boolean isFirst = (offset == 0L);
-                        boolean isLast = (offset == this.activeModules.size() - 1);
+                        boolean isLast = (offset == this.renderEntries.size() - 1);
                         boolean sideLeft = this.posX.getValue() == 1;
                         boolean sideRight = this.posX.getValue() == 0;
                         boolean isTopEntry = (this.posY.getValue() == 0) ? isFirst : isLast;
@@ -261,8 +299,9 @@ public class HUD extends Module {
                             );
                 }
                 if (this.suffixes.getValue() && moduleSuffix.length > 0) {
-                    float width = (float) mc.fontRendererObj.getStringWidth(moduleName) + 3.0F;
-                    for (String string : moduleSuffix) {
+                    float width = (float) entry.nameWidth + 3.0F;
+                    for (int i = 0; i < moduleSuffix.length; i++) {
+                        String string = moduleSuffix[i];
                         if (this.shadow.getValue()) {
                             mc.fontRendererObj
                                     .drawStringWithShadow(
@@ -281,7 +320,7 @@ public class HUD extends Module {
                                             false
                                     );
                         }
-                        width += (float) mc.fontRendererObj.getStringWidth(string) + (this.shadow.getValue() ? 3.0F : 2.0F);
+                        width += (float) entry.suffixWidths[i] + (this.shadow.getValue() ? 3.0F : 2.0F);
                     }
                 }
                 y += (height + (this.shadow.getValue() ? 1.0F : 0.0F) + this.padding.getValue() * 2.0F) * this.scale.getValue() * (this.posY.getValue() == 0 ? 1.0F : -1.0F);
@@ -294,13 +333,14 @@ public class HUD extends Module {
                     if (movementPacketSize > 0L) {
                         GlStateManager.enableBlend();
                         GlStateManager.blendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+                        String sizeText = String.valueOf(movementPacketSize);
                         mc.fontRendererObj
                                 .drawString(
-                                        String.valueOf(movementPacketSize),
-                                        (float) new ScaledResolution(mc).getScaledWidth() / 2.0F / this.scale.getValue()
-                                                - (float) mc.fontRendererObj.getStringWidth(String.valueOf(movementPacketSize)) / 2.0F,
-                                        (float) new ScaledResolution(mc).getScaledHeight() / 5.0F * 3.0F / this.scale.getValue(),
-                                        this.getColor(l, offset).getRGB() & 16777215 | -1090519040,
+                                        sizeText,
+                                        (float) sr.getScaledWidth() / 2.0F / this.scale.getValue()
+                                                - (float) mc.fontRendererObj.getStringWidth(sizeText) / 2.0F,
+                                        (float) sr.getScaledHeight() / 5.0F * 3.0F / this.scale.getValue(),
+                                        this.getColorRGB(l, offset) & 16777215 | -1090519040,
                                         this.shadow.getValue()
                                 );
                         GlStateManager.disableBlend();
@@ -364,10 +404,10 @@ public class HUD extends Module {
         float slide = (1.0F - motion) * 14.0F + (1.0F - alpha) * 5.0F;
         float renderX = x + slide;
         int statusColor = notificationStatusColor(text, alpha);
-        int bg = new Color(10, 12, 16, (int) (92 * alpha)).getRGB();
-        int border = new Color(255, 255, 255, (int) (24 * alpha)).getRGB();
-        int neutralText = new Color(238, 241, 245, (int) (242 * alpha)).getRGB();
-        int depth = new Color(0, 0, 0, (int) (28 * alpha)).getRGB();
+        int bg = argb(10, 12, 16, (int) (92 * alpha));
+        int border = argb(255, 255, 255, (int) (24 * alpha));
+        int neutralText = argb(238, 241, 245, (int) (242 * alpha));
+        int depth = argb(0, 0, 0, (int) (28 * alpha));
         float radius = 5.0F;
 
         RenderUtil.drawRoundedRect(renderX + 1.0F, y + 1.5F, boxWidth, boxHeight, radius + 1.0F,
@@ -381,7 +421,7 @@ public class HUD extends Module {
         float progressY = y + boxHeight - 2.0F;
         float progressW = boxWidth - 12.0F;
         RenderUtil.drawRoundedRect(progressX, progressY, progressW, 1.0F, 0.5F,
-                new Color(255, 255, 255, (int) (8 * alpha)).getRGB(), true, true, true, true);
+                argb(255, 255, 255, (int) (8 * alpha)), true, true, true, true);
         RenderUtil.drawRoundedRect(progressX, progressY, Math.max(1.0F, progressW * progress), 1.0F, 0.5F,
                 statusColor, true, true, true, true);
 
@@ -424,7 +464,12 @@ public class HUD extends Module {
         String lower = text.toLowerCase(Locale.ROOT);
         int rgb = lower.endsWith(" enabled") ? 0x41D982 : lower.endsWith(" disabled") ? 0xFF5C6C : 0xE5E9F0;
         int a = Math.max(0, Math.min(255, (int) (245 * alpha)));
-        return new Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, a).getRGB();
+        return argb((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, a);
+    }
+
+    private static int argb(int red, int green, int blue, int alpha) {
+        alpha = Math.max(0, Math.min(255, alpha));
+        return (alpha & 0xFF) << 24 | (red & 0xFF) << 16 | (green & 0xFF) << 8 | blue & 0xFF;
     }
 
     private void drawNotificationText(String text, float x, float y, int neutralColor, int statusColor) {
@@ -442,5 +487,29 @@ public class HUD extends Module {
         String main = text.substring(0, text.length() - suffix.length());
         mc.fontRendererObj.drawString(main, (int) x, (int) y, neutralColor, false);
         mc.fontRendererObj.drawString(suffix.trim(), (int) (x + mc.fontRendererObj.getStringWidth(main + " ")), (int) y, statusColor, false);
+    }
+
+    /**
+     * 预计算的 HUD 行渲染数据，每 tick 构建一次，渲染循环直接复用，
+     * 避免每帧重复做模块名/后缀字符串处理与字体宽度计算。
+     */
+    private static final class RenderEntry {
+        final String name;
+        final String[] suffix;
+        final int nameWidth;
+        final int[] suffixWidths;
+        final int totalWidth;
+
+        RenderEntry(String name, String[] suffix, int nameWidth, int[] suffixWidths, int totalWidth) {
+            this.name = name;
+            this.suffix = suffix;
+            this.nameWidth = nameWidth;
+            this.suffixWidths = suffixWidths;
+            this.totalWidth = totalWidth;
+        }
+
+        int totalWidth() {
+            return this.totalWidth;
+        }
     }
 }

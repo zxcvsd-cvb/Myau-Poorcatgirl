@@ -11,13 +11,37 @@ import myau.util.ChatUtil;
 import myau.util.SoundUtil;
 
 import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
 
 public class ModuleManager {
     private boolean sound = false;
     public final LinkedHashMap<Class<?>, Module> modules = new LinkedHashMap<>();
 
+    /**
+     * 模块名称（小写）到模块的惰性索引。模块仅在初始化阶段注册，
+     * 之后保持不变，因此首次按名查找后即可复用该索引，避免每次线性扫描。
+     */
+    private Map<String, Module> nameIndex;
+
     public Module getModule(String string) {
-        return this.modules.values().stream().filter(mD -> mD.getName().equalsIgnoreCase(string)).findFirst().orElse(null);
+        if (string == null) {
+            return null;
+        }
+        Map<String, Module> index = this.nameIndex;
+        if (index == null || index.size() != this.modules.size()) {
+            index = buildNameIndex();
+            this.nameIndex = index;
+        }
+        return index.get(string.toLowerCase(Locale.ROOT));
+    }
+
+    private Map<String, Module> buildNameIndex() {
+        final Map<String, Module> index = new LinkedHashMap<>(this.modules.size());
+        for (Module module : this.modules.values()) {
+            index.put(module.getName().toLowerCase(Locale.ROOT), module);
+        }
+        return index;
     }
 
     public Module getModule(Class<?> clazz){
